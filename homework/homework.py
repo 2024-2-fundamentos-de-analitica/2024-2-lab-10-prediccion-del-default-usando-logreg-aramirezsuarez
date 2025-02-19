@@ -95,3 +95,107 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import pandas as pd
+import numpy as np
+import gzip
+import pickle
+import json
+import os
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import precision_score, balanced_accuracy_score, recall_score, f1_score, confusion_matrix
+
+# Cargar datos
+train_df = pd.read_csv("files/input/train_data.csv.zip", compression="zip")
+test_df = pd.read_csv("files/input/test_data.csv.zip", compression="zip")
+
+# Preprocesamiento de datos
+train_df.rename(columns={'default payment next month': 'default'}, inplace=True)
+test_df.rename(columns={'default payment next month': 'default'}, inplace=True)
+train_df.drop(columns=['ID'], inplace=True, errors='ignore')
+test_df.drop(columns=['ID'], inplace=True, errors='ignore')
+train_df.dropna(inplace=True)
+test_df.dropna(inplace=True)
+
+# Filtrar valores inválidos
+target_features = ["EDUCATION", "MARRIAGE"]
+train_df = train_df[(train_df["EDUCATION"] != 0) & (train_df["MARRIAGE"] != 0)]
+test_df = test_df[(test_df["EDUCATION"] != 0) & (test_df["MARRIAGE"] != 0)]
+train_df["EDUCATION"] = train_df["EDUCATION"].apply(lambda x: 4 if x > 4 else x)
+test_df["EDUCATION"] = test_df["EDUCATION"].apply(lambda x: 4 if x > 4 else x)
+
+# Separar variables dependientes e independientes
+X_train, y_train = train_df.drop(columns=['default']), train_df['default']
+X_test, y_test = test_df.drop(columns=['default']), test_df['default']
+
+# Identificar características categóricas
+categorical_columns = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
+
+# Construcción del pipeline
+preprocessor = ColumnTransformer([
+    ('categorical_encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_columns)],
+    remainder='passthrough'
+)
+
+pipeline = Pipeline([
+    ('data_preprocessor', preprocessor),
+    ('feature_scaler', MinMaxScaler()),
+    ('feature_selector', SelectKBest(score_func=f_classif, k=10)),
+    ('classifier', LogisticRegression(max_iter=500, random_state=42))
+])
+
+# Hiperparámetros para optimización
+param_grid = {
+    'feature_selector__k': range(1, 11),
+    'classifier__C': [0.001, 0.01, 0.1, 1, 10, 100],
+    'classifier__penalty': ['l1', 'l2'],
+    'classifier__solver': ['liblinear'],
+    "classifier__max_iter": [100, 200]
+}
+
+# Búsqueda de hiperparámetros
+grid_search = GridSearchCV(pipeline, param_grid=param_grid, cv=10, scoring='balanced_accuracy', n_jobs=-1, refit=True)
+grid_search.fit(X_train, y_train)
+
+# Guardar el modelo
+os.makedirs("files/models/", exist_ok=True)
+with gzip.open("files/models/model.pkl.gz", 'wb') as model_file:
+    pickle.dump(grid_search, model_file)
+
+def compute_classification_metrics(y_true, y_pred, dataset_name):
+    return {
+        'type': 'metrics',
+        'dataset': dataset_name,
+        'precision': precision_score(y_true, y_pred),
+        'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
+        'recall': recall_score(y_true, y_pred),
+        'f1_score': f1_score(y_true, y_pred)
+    }
+
+def generate_confusion_matrix(y_true, y_pred, dataset_name):
+    cm = confusion_matrix(y_true, y_pred)
+    return {
+        'type': 'cm_matrix',
+        'dataset': dataset_name,
+        'true_0': {"predicted_0": int(cm[0, 0]), "predicted_1": int(cm[0, 1])},
+        'true_1': {"predicted_0": int(cm[1, 0]), "predicted_1": int(cm[1, 1])}
+    }
+
+# Evaluar el modelo
+model_metrics = [
+    compute_classification_metrics(y_train, grid_search.predict(X_train), 'train'),
+    compute_classification_metrics(y_test, grid_search.predict(X_test), 'test'),
+    generate_confusion_matrix(y_train, grid_search.predict(X_train), 'train'),
+    generate_confusion_matrix(y_test, grid_search.predict(X_test), 'test')
+]
+
+# Guardar métricas
+os.makedirs("files/output/", exist_ok=True)
+with open("files/output/metrics.json", "w") as metrics_file:
+    for metric in model_metrics:
+        metrics_file.write(json.dumps(metric) + "\n")
